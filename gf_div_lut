@@ -1,0 +1,80 @@
+-- File: gf_div_lut.vhd
+-- Description: GF divider using log/antilog lookup tables
+
+library ieee;
+use ieee.std_logic_1164.all;
+use ieee.numeric_std.all;
+use work.gf_pkg.all;
+
+entity gf_div_lut is
+    generic (
+        GF_M      : integer := 8;
+        PRIM_POLY : integer := 285
+    );
+    port (
+        clk       : in  std_logic;
+        rst_n     : in  std_logic;
+        dividend  : in  std_logic_vector(GF_M-1 downto 0);
+        divisor   : in  std_logic_vector(GF_M-1 downto 0);
+        valid     : in  std_logic;
+        quotient  : out std_logic_vector(GF_M-1 downto 0);
+        ready     : out std_logic;
+        div_zero  : out std_logic
+    );
+end entity gf_div_lut;
+
+architecture rtl of gf_div_lut is
+    
+    constant FIELD_SIZE : integer := 2**GF_M;
+    constant Q : integer := FIELD_SIZE - 1;
+    constant ANTILOG_TABLE : gf_table_t := gen_antilog_table(GF_M, PRIM_POLY);
+    constant LOG_TABLE : gf_table_t := gen_log_table(ANTILOG_TABLE, FIELD_SIZE);
+    
+    attribute rom_style : string;
+    attribute rom_style of ANTILOG_TABLE : constant is "M20K";
+    attribute rom_style of LOG_TABLE : constant is "M20K";
+    
+    signal dividend_reg, divisor_reg : std_logic_vector(GF_M-1 downto 0);
+    signal valid_reg : std_logic;
+    
+begin
+    
+    process(clk, rst_n)
+        variable a_int, b_int, quot_int : integer range 0 to FIELD_SIZE-1;
+        variable log_a, log_b, log_diff : integer;
+    begin
+        if rst_n = '0' then
+            quotient <= (others => '0');
+            ready <= '0';
+            div_zero <= '0';
+            dividend_reg <= (others => '0');
+            divisor_reg <= (others => '0');
+            valid_reg <= '0';
+        elsif rising_edge(clk) then
+            dividend_reg <= dividend;
+            divisor_reg <= divisor;
+            valid_reg <= valid;
+            ready <= valid_reg;
+            div_zero <= '0';
+            
+            if valid_reg = '1' then
+                a_int := to_integer(unsigned(dividend_reg));
+                b_int := to_integer(unsigned(divisor_reg));
+                
+                if b_int = 0 then
+                    quotient <= (others => '0');
+                    div_zero <= '1';
+                elsif a_int = 0 then
+                    quotient <= (others => '0');
+                else
+                    log_a := LOG_TABLE(a_int);
+                    log_b := LOG_TABLE(b_int);
+                    log_diff := (log_a - log_b + Q) mod Q;
+                    quot_int := ANTILOG_TABLE(log_diff);
+                    quotient <= std_logic_vector(to_unsigned(quot_int, GF_M));
+                end if;
+            end if;
+        end if;
+    end process;
+    
+end architecture rtl;
