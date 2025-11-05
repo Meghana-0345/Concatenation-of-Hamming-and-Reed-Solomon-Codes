@@ -1,0 +1,118 @@
+-- File: rs_syndrome_calc.vhd
+-- Description: Syndrome calculator with runtime alpha power computation
+
+library ieee;
+use ieee.std_logic_1164.all;
+use ieee.numeric_std.all;
+use work.gf_pkg.all;
+
+entity rs_syndrome_calc is
+    generic (
+        GF_M      : integer := 8;
+        N         : integer := 255;
+        T         : integer := 16;
+        PRIM_POLY : integer := 285
+    );
+    port (
+        clk            : in  std_logic;
+        rst_n          : in  std_logic;
+        start          : in  std_logic;
+        symbol_in      : in  std_logic_vector(GF_M-1 downto 0);
+        symbol_valid   : in  std_logic;
+        syndromes_out  : out std_logic_vector((2*T)*GF_M-1 downto 0);
+        syndromes_valid: out std_logic;
+        busy           : out std_logic
+    );
+end entity rs_syndrome_calc;
+
+architecture rtl of rs_syndrome_calc is
+    
+    constant NPARITY : integer := 2 * T;
+    
+    type syndrome_array_t is array (0 to NPARITY-1) of std_logic_vector(GF_M-1 downto 0);
+    signal syndromes : syndrome_array_t;
+    
+    type state_t is (IDLE, INIT_POWERS, ACCUMULATE, DONE_STATE);
+    signal state : state_t;
+    
+    signal symbol_count : integer range 0 to N;
+    signal init_count : integer range 0 to NPARITY;
+    
+    type alpha_powers_t is array (0 to NPARITY-1) of std_logic_vector(GF_M-1 downto 0);
+    signal alpha_powers : alpha_powers_t;
+    signal power_accum : alpha_powers_t;
+    
+begin
+    
+    -- Runtime computation of alpha powers
+    syndrome_proc : process(clk, rst_n)
+        variable temp_product : std_logic_vector(GF_M-1 downto 0);
+        variable alpha : std_logic_vector(GF_M-1 downto 0);
+    begin
+        if rst_n = '0' then
+            state <= IDLE;
+            syndromes <= (others => (others => '0'));
+            syndromes_valid <= '0';
+            busy <= '0';
+            symbol_count <= 0;
+            init_count <= 0;
+            alpha_powers <= (others => (others => '0'));
+            power_accum <= (others => (others => '0'));
+        elsif rising_edge(clk) then
+            case state is
+                when IDLE =>
+                    syndromes_valid <= '0';
+                    busy <= '0';
+                    symbol_count <= 0;
+                    if start = '1' then
+                        state <= INIT_POWERS;
+                        busy <= '1';
+                        init_count <= 0;
+                        -- Initialize alpha = primitive element (x = 0b10)
+                        alpha := (1 => '1', others => '0');
+                        alpha_powers(0) <= alpha;
+                    end if;
+                    
+                when INIT_POWERS =>
+                    -- Compute alpha^(i+1) = alpha^i * alpha iteratively
+                    if init_count < NPARITY-1 then
+                        alpha_powers(init_count + 1) <= gf_mult_comb(
+                            alpha_powers(init_count),
+                            std_logic_vector(to_unsigned(2, GF_M)), -- alpha = 2
+                            PRIM_POLY, GF_M
+                        );
+                        init_count <= init_count + 1;
+                    else
+                        state <= ACCUMULATE;
+                        syndromes <= (others => (others => '0'));
+                        for i in 0 to NPARITY-1 loop
+                            power_accum(i) <= (0 => '1', others => '0'); -- Initialize to 1
+                        end loop;
+                        symbol_count <= 0;
+                    end if;
+                    
+                when ACCUMULATE =>
+                    if symbol_valid = '1' then
+                        for i in 0 to NPARITY-1 loop
+                            temp_product := gf_mult_comb(symbol_in, power_accum(i), PRIM_POLY, GF_M);
+                            syndromes(i) <= gf_add(syndromes(i), temp_product);
+                            power_accum(i) <= gf_mult_comb(power_accum(i), alpha_powers(i), PRIM_POLY, GF_M);
+                        end loop;
+                        symbol_count <= symbol_count + 1;
+                        if symbol_count = N - 1 then
+                            state <= DONE_STATE;
+                        end if;
+                    end if;
+                    
+                when DONE_STATE =>
+                    for i in 0 to NPARITY-1 loop
+                        syndromes_out((i+1)*GF_M-1 downto i*GF_M) <= syndromes(i);
+                    end loop;
+                    syndromes_valid <= '1';
+                    busy <= '0';
+                    state <= IDLE;
+            end case;
+        end if;
+    end process;
+    
+end architecture rtl;
