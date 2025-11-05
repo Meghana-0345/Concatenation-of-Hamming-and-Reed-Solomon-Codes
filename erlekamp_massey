@@ -1,0 +1,134 @@
+-- File: berlekamp_massey.vhd
+-- Description: Berlekamp-Massey algorithm
+
+library ieee;
+use ieee.std_logic_1164.all;
+use ieee.numeric_std.all;
+use work.gf_pkg.all;
+
+entity berlekamp_massey is
+    generic (
+        GF_M      : integer := 8;
+        T         : integer := 16;
+        PRIM_POLY : integer := 285
+    );
+    port (
+        clk             : in  std_logic;
+        rst_n           : in  std_logic;
+        start           : in  std_logic;
+        syndromes_in    : in  std_logic_vector((2*T)*GF_M-1 downto 0);
+        erasure_count   : in  integer range 0 to T;
+        lambda_out      : out std_logic_vector((T+1)*GF_M-1 downto 0);
+        omega_out       : out std_logic_vector((T+1)*GF_M-1 downto 0);
+        error_count_out : out integer range 0 to T;
+        valid           : out std_logic;
+        busy            : out std_logic
+    );
+end entity berlekamp_massey;
+
+architecture rtl of berlekamp_massey is
+    
+    constant NPARITY : integer := 2 * T;
+    
+    type poly_array_t is array (0 to T) of std_logic_vector(GF_M-1 downto 0);
+    signal lambda, lambda_prev, temp_lambda, omega : poly_array_t;
+    
+    type syndrome_array_t is array (0 to NPARITY-1) of std_logic_vector(GF_M-1 downto 0);
+    signal syndromes : syndrome_array_t;
+    
+    type state_t is (IDLE, ITERATE, COMPUTE_OMEGA, DONE_STATE);
+    signal state : state_t;
+    
+    signal iteration : integer range 0 to NPARITY+1;
+    signal L : integer range 0 to T;
+    
+begin
+    
+    bm_proc : process(clk, rst_n)
+        variable delta : std_logic_vector(GF_M-1 downto 0);
+        variable temp_sum : std_logic_vector(GF_M-1 downto 0);
+        variable i, j : integer range 0 to T;
+    begin
+        if rst_n = '0' then
+            state <= IDLE;
+            valid <= '0';
+            busy <= '0';
+            iteration <= 0;
+            L <= 0;
+            lambda <= (others => (others => '0'));
+            lambda_prev <= (others => (others => '0'));
+            temp_lambda <= (others => (others => '0'));
+            omega <= (others => (others => '0'));
+            syndromes <= (others => (others => '0'));
+            error_count_out <= 0;
+        elsif rising_edge(clk) then
+            case state is
+                when IDLE =>
+                    valid <= '0';
+                    busy <= '0';
+                    if start = '1' then
+                        for i in 0 to NPARITY-1 loop
+                            syndromes(i) <= syndromes_in((i+1)*GF_M-1 downto i*GF_M);
+                        end loop;
+                        lambda(0) <= (0 => '1', others => '0');
+                        for i in 1 to T loop
+                            lambda(i) <= (others => '0');
+                            lambda_prev(i) <= (others => '0');
+                        end loop;
+                        lambda_prev(0) <= (others => '0');
+                        lambda_prev(1) <= (0 => '1', others => '0');
+                        L <= 0;
+                        iteration <= 0;
+                        state <= ITERATE;
+                        busy <= '1';
+                    end if;
+                when ITERATE =>
+                    if iteration < NPARITY then
+                        delta := syndromes(iteration);
+                        for i in 1 to T loop
+                            if i <= L and iteration >= i then
+                                temp_sum := gf_mult_comb(lambda(i), syndromes(iteration-i), PRIM_POLY, GF_M);
+                                delta := gf_add(delta, temp_sum);
+                            end if;
+                        end loop;
+                        if unsigned(delta) /= 0 then
+                            temp_lambda <= lambda;
+                            for i in 0 to T loop
+                                if i > 0 then
+                                    lambda(i) <= gf_add(lambda(i), gf_mult_comb(delta, lambda_prev(i-1), PRIM_POLY, GF_M));
+                                end if;
+                            end loop;
+                            if 2 * L <= iteration then
+                                L <= iteration + 1 - L;
+                                lambda_prev <= temp_lambda;
+                            end if;
+                        end if;
+                        iteration <= iteration + 1;
+                    else
+                        state <= COMPUTE_OMEGA;
+                    end if;
+                when COMPUTE_OMEGA =>
+                    for i in 0 to T loop
+                        temp_sum := (others => '0');
+                        for j in 0 to T loop
+                            if j <= i and j < NPARITY then
+                                temp_sum := gf_add(temp_sum, gf_mult_comb(syndromes(j), lambda(i-j), PRIM_POLY, GF_M));
+                            end if;
+                        end loop;
+                        omega(i) <= temp_sum;
+                    end loop;
+                    error_count_out <= L;
+                    state <= DONE_STATE;
+                when DONE_STATE =>
+                    for i in 0 to T loop
+                        lambda_out((i+1)*GF_M-1 downto i*GF_M) <= lambda(i);
+                        omega_out((i+1)*GF_M-1 downto i*GF_M) <= omega(i);
+                    end loop;
+                    valid <= '1';
+                    busy <= '0';
+                    state <= IDLE;
+            end case;
+        end if;
+    end process;
+    
+end architecture rtl;
