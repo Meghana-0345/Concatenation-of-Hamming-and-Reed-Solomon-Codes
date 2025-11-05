@@ -1,0 +1,205 @@
+library ieee;
+use ieee.std_logic_1164.all;
+use ieee.numeric_std.all;
+
+entity concat_decoder_hamming_outer_rs_inner is
+  generic (
+    GF_M      : integer := 4;
+    RS_N      : integer := 15;
+    RS_K      : integer := 7;
+    RS_T      : integer := 4;
+    PRIM_POLY : integer := 19;
+    HAM_N     : integer := 15;
+    HAM_K     : integer := 11
+  );
+  port (
+    clk : in std_logic;
+    rst_n : in std_logic;
+    
+    data_in : in std_logic_vector(GF_M - 1 downto 0);
+    data_in_valid : in std_logic;
+    data_ready : out std_logic;
+    
+    data_out : out std_logic_vector(HAM_K - 1 downto 0);
+    data_out_valid : out std_logic;
+    
+    uncorrectable_errors : out std_logic
+  );
+end entity concat_decoder_hamming_outer_rs_inner;
+
+architecture rtl of concat_decoder_hamming_outer_rs_inner is
+
+  signal rs_symbol_in : std_logic_vector(GF_M - 1 downto 0);
+  
+  type symbol_buffer_t is array (0 to RS_N - 1) of std_logic_vector(GF_M - 1 downto 0);
+  signal rs_symbol_buffer : symbol_buffer_t;
+  signal rs_buffer_index : integer range 0 to RS_N - 1;
+  signal rs_buffer_full : std_logic;
+  
+  type codeword_buffer_t is array (0 to RS_K - 1) of std_logic_vector(HAM_N - 1 downto 0);
+  signal ham_codeword_buffer : codeword_buffer_t;
+  
+  signal ham_codeword_in : std_logic_vector(HAM_N - 1 downto 0);
+  signal ham_codeword_valid : std_logic;
+  signal ham_data_out : std_logic_vector(HAM_K - 1 downto 0);
+  signal ham_data_valid : std_logic;
+  signal ham_error : std_logic;
+  
+  signal output_codeword_index : integer range 0 to RS_K - 1;
+  signal data_ready_internal : std_logic;
+  
+  type state_t is (IDLE, COLLECT_RS, CONVERT_RS, HAMMING_DECODE, OUTPUT_DATA, DONE_STATE);
+  signal state : state_t;
+
+begin
+
+  -- ===== Buffer incoming RS symbols =====
+  process (clk, rst_n)
+  begin
+    if rst_n = '0' then
+      rs_buffer_index <= 0;
+      rs_buffer_full <= '0';
+      rs_symbol_buffer <= (others => (others => '0'));
+    elsif rising_edge(clk) then
+      if state = IDLE then
+        rs_buffer_index <= 0;
+        rs_buffer_full <= '0';
+      elsif state = COLLECT_RS and data_in_valid = '1' then
+        rs_symbol_buffer(rs_buffer_index) <= data_in;
+        if rs_buffer_index = RS_N - 1 then
+          rs_buffer_full <= '1';
+          rs_buffer_index <= 0;
+        else
+          rs_buffer_index <= rs_buffer_index + 1;
+        end if;
+      end if;
+    end if;
+  end process;
+
+  -- ===== Convert RS symbols back to Hamming codewords (Combinatorial) =====
+  convert_rs_to_hamming_process : process (rs_symbol_buffer)
+    variable bit_index : integer;
+    variable symbol_index : integer;
+    variable temp_codeword : std_logic_vector(HAM_N - 1 downto 0);
+  begin
+    -- Initialize all codewords to zero
+    for i in 0 to RS_K - 1 loop
+      ham_codeword_buffer(i) <= (others => '0');
+    end loop;
+    
+    symbol_index := 0;
+    bit_index := 0;
+    
+    for i in 0 to RS_K - 1 loop
+      for j in 0 to HAM_N - 1 loop
+        if symbol_index < RS_N then
+          temp_codeword := ham_codeword_buffer(i);
+          temp_codeword(j) := rs_symbol_buffer(symbol_index)((bit_index mod GF_M));
+          ham_codeword_buffer(i) <= temp_codeword;
+          bit_index := bit_index + 1;
+          
+          if (bit_index mod GF_M) = 0 then
+            symbol_index := symbol_index + 1;
+          end if;
+        end if;
+      end loop;
+    end loop;
+  end process;
+
+  -- ===== STAGE 1: Hamming Decoder (Symbol-Level) =====
+  hamming_decoder_inst : entity work.hamming_decoder_symbol_level
+    generic map (
+      N => HAM_N,
+      K => HAM_K
+    )
+    port map (
+      clk => clk,
+      rst_n => rst_n,
+      codeword_in => ham_codeword_in,
+      codeword_valid => ham_codeword_valid,
+      data_ready => open,
+      data_out => ham_data_out,
+      data_out_valid => ham_data_valid,
+      error_detected => ham_error
+    );
+
+  -- ===== Output decoded symbols =====
+  process (clk, rst_n)
+  begin
+    if rst_n = '0' then
+      data_out <= (others => '0');
+      data_out_valid <= '0';
+    elsif rising_edge(clk) then
+      if state = OUTPUT_DATA and ham_data_valid = '1' then
+        data_out <= ham_data_out;
+        data_out_valid <= '1';
+      else
+        data_out_valid <= '0';
+      end if;
+    end if;
+  end process;
+
+  -- ===== State Machine =====
+  process (clk, rst_n)
+  begin
+    if rst_n = '0' then
+      state <= IDLE;
+      data_ready_internal <= '0';
+      ham_codeword_valid <= '0';
+      uncorrectable_errors <= '0';
+      output_codeword_index <= 0;
+    elsif rising_edge(clk) then
+      case state is
+        when IDLE =>
+          data_ready_internal <= '1';
+          uncorrectable_errors <= '0';
+          ham_codeword_valid <= '0';
+          
+          if data_in_valid = '1' then
+            state <= COLLECT_RS;
+          end if;
+
+        when COLLECT_RS =>
+          data_ready_internal <= not rs_buffer_full;
+          
+          if rs_buffer_full = '1' then
+            state <= CONVERT_RS;
+            data_ready_internal <= '0';
+          end if;
+
+        when CONVERT_RS =>
+          state <= HAMMING_DECODE;
+          ham_codeword_valid <= '1';
+          output_codeword_index <= 0;
+          data_ready_internal <= '0';
+
+        when HAMMING_DECODE =>
+          ham_codeword_in <= ham_codeword_buffer(output_codeword_index);
+          data_ready_internal <= '0';
+          
+          if ham_data_valid = '1' then
+            state <= OUTPUT_DATA;
+          end if;
+
+        when OUTPUT_DATA =>
+          data_ready_internal <= '0';
+          
+          if output_codeword_index = RS_K - 1 then
+            state <= DONE_STATE;
+            uncorrectable_errors <= ham_error;
+          else
+            output_codeword_index <= output_codeword_index + 1;
+            state <= HAMMING_DECODE;
+          end if;
+
+        when DONE_STATE =>
+          data_ready_internal <= '0';
+          state <= IDLE;
+      end case;
+    end if;
+  end process;
+
+  -- ===== Single driver for data_ready =====
+  data_ready <= data_ready_internal;
+
+end architecture rtl;
