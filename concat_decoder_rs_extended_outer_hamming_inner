@@ -1,0 +1,230 @@
+library ieee;
+use ieee.std_logic_1164.all;
+use ieee.numeric_std.all;
+
+entity concat_decoder_rs_extended_outer_hamming_inner is
+  generic (
+    GF_M      : integer := 4;
+    RS_N      : integer := 16;
+    RS_K      : integer := 7;
+    RS_T      : integer := 4;
+    PRIM_POLY : integer := 19;
+    HAM_N     : integer := 15;
+    HAM_K     : integer := 11
+  );
+  port (
+    clk : in std_logic;
+    rst_n : in std_logic;
+    
+    data_in : in std_logic_vector(RS_N * HAM_N - 1 downto 0);
+    data_in_valid : in std_logic;
+    data_ready : out std_logic;
+    
+    data_out : out std_logic_vector(RS_K * GF_M - 1 downto 0);
+    data_out_valid : out std_logic;
+    
+    uncorrectable_errors : out std_logic
+  );
+end entity concat_decoder_rs_extended_outer_hamming_inner;
+
+architecture rtl of concat_decoder_rs_extended_outer_hamming_inner is
+
+  signal hamming_decoded_data : std_logic_vector(RS_N * HAM_K - 1 downto 0);
+  signal hamming_decoded_valid : std_logic;
+  signal hamming_error_flags : std_logic_vector(RS_N - 1 downto 0);
+  signal hamming_ready : std_logic;
+  
+  signal rs_symbols_unpacked : std_logic_vector(RS_N * GF_M - 1 downto 0);
+  signal rs_symbols_valid : std_logic;
+  
+  signal rs_symbol_in : std_logic_vector(GF_M - 1 downto 0);
+  signal rs_symbol_in_valid : std_logic;
+  signal rs_symbol_out : std_logic_vector(GF_M - 1 downto 0);
+  signal rs_symbol_out_valid : std_logic;
+  signal rs_start : std_logic;
+  signal rs_done : std_logic;
+  signal rs_errors : std_logic;
+  signal rs_error_count : integer range 0 to RS_T;
+  signal rs_busy : std_logic;
+  
+  signal rs_decoded_buffer : std_logic_vector(RS_K * GF_M - 1 downto 0);
+  signal data_out_valid_internal : std_logic;
+  signal data_ready_internal : std_logic;
+  signal uncorrectable_errors_internal : std_logic;
+  
+  signal symbol_feed_index : integer range 0 to RS_N - 1;
+  signal symbol_output_index : integer range 0 to RS_K - 1;
+  
+  type state_t is (IDLE, HAMMING_DECODE, FEED_RS_SYMBOLS, WAIT_RS, COLLECT_RS_OUTPUT, OUTPUT_DATA, DONE_STATE);
+  signal state : state_t;
+
+begin
+
+  -- ===== STAGE 1: Hamming Decoder (Parallel) =====
+  hamming_decoder_inst : entity work.hamming_decoder_parallel_extended
+    generic map (
+      N => HAM_N,
+      K => HAM_K,
+      NUM_SYMBOLS => RS_N
+    )
+    port map (
+      clk => clk,
+      rst => not rst_n,
+      data_in => data_in,
+      data_in_valid => data_in_valid,
+      data_in_ready => hamming_ready,
+      data_out => hamming_decoded_data,
+      data_out_valid => hamming_decoded_valid,
+      data_out_ready => '1',
+      error_flags => hamming_error_flags
+    );
+
+  -- ===== STAGE 2: Unpack Hamming output to RS symbols =====
+  unpack_hamming_output : process (hamming_decoded_data)
+    variable bit_index : integer;
+  begin
+    bit_index := 0;
+    for i in 0 to RS_N - 1 loop
+      if (bit_index + (GF_M - 1)) < (RS_N * HAM_K) then
+        rs_symbols_unpacked((i + 1) * GF_M - 1 downto i * GF_M) <= 
+          hamming_decoded_data(bit_index + (GF_M - 1) downto bit_index);
+        bit_index := bit_index + GF_M;
+        
+        if (i + 1) mod 3 = 0 then
+          bit_index := bit_index + 1;
+        end if;
+      else
+        rs_symbols_unpacked((i + 1) * GF_M - 1 downto i * GF_M) <= (others => '0');
+      end if;
+    end loop;
+  end process;
+
+  rs_symbols_valid <= hamming_decoded_valid;
+
+  -- ===== Select current RS symbol to feed decoder =====
+  rs_symbol_in <= rs_symbols_unpacked((symbol_feed_index + 1) * GF_M - 1 downto symbol_feed_index * GF_M);
+
+  -- ===== STAGE 3: Reed-Solomon Extended Decoder =====
+  rs_decoder_ext_inst : entity work.rs_decoder_ext
+    generic map (
+      GF_M      => GF_M,
+      N         => RS_N,
+      K         => RS_K,
+      T         => RS_T,
+      PRIM_POLY => PRIM_POLY,
+      SHORTENED => 0
+    )
+    port map (
+      clk                => clk,
+      rst_n              => rst_n,
+      start              => rs_start,
+      codeword_in        => rs_symbol_in,
+      data_valid         => rs_symbol_in_valid,
+      erasure_location   => (others => '0'),
+      erasure_valid      => '0',
+      decoding_done      => rs_done,
+      corrected_data_out => rs_symbol_out,
+      output_valid       => rs_symbol_out_valid,
+      error_count        => rs_error_count,
+      failure_flag       => rs_errors,
+      busy               => rs_busy
+    );
+
+  -- ===== Collect RS decoder outputs into buffer =====
+  process (clk, rst_n)
+  begin
+    if rst_n = '0' then
+      rs_decoded_buffer <= (others => '0');
+    elsif rising_edge(clk) then
+      if state = COLLECT_RS_OUTPUT and rs_symbol_out_valid = '1' then
+        rs_decoded_buffer((symbol_output_index + 1) * GF_M - 1 downto symbol_output_index * GF_M) <= rs_symbol_out;
+      end if;
+    end if;
+  end process;
+
+  -- ===== State Machine (ONLY driver for symbol_output_index) =====
+  process (clk, rst_n)
+  begin
+    if rst_n = '0' then
+      state <= IDLE;
+      data_ready_internal <= '0';
+      data_out_valid_internal <= '0';
+      uncorrectable_errors_internal <= '0';
+      rs_start <= '0';
+      rs_symbol_in_valid <= '0';
+      symbol_feed_index <= 0;
+      symbol_output_index <= 0;
+    elsif rising_edge(clk) then
+      case state is
+        when IDLE =>
+          data_ready_internal <= '1';
+          data_out_valid_internal <= '0';
+          uncorrectable_errors_internal <= '0';
+          rs_start <= '0';
+          rs_symbol_in_valid <= '0';
+          symbol_feed_index <= 0;
+          symbol_output_index <= 0;
+          
+          if data_in_valid = '1' then
+            state <= HAMMING_DECODE;
+          end if;
+
+        when HAMMING_DECODE =>
+          data_ready_internal <= '0';
+          
+          if hamming_decoded_valid = '1' then
+            rs_start <= '1';
+            symbol_feed_index <= 0;
+            state <= FEED_RS_SYMBOLS;
+          else
+            rs_start <= '0';
+          end if;
+
+        when FEED_RS_SYMBOLS =>
+          rs_start <= '0';
+          rs_symbol_in_valid <= '1';
+          
+          if symbol_feed_index = RS_N - 1 then
+            rs_symbol_in_valid <= '0';
+            state <= WAIT_RS;
+            symbol_feed_index <= 0;
+          else
+            symbol_feed_index <= symbol_feed_index + 1;
+          end if;
+
+        when WAIT_RS =>
+          if rs_done = '1' then
+            symbol_output_index <= 0;
+            state <= COLLECT_RS_OUTPUT;
+          end if;
+
+        when COLLECT_RS_OUTPUT =>
+          if rs_symbol_out_valid = '1' then
+            if symbol_output_index = RS_K - 1 then
+              state <= OUTPUT_DATA;
+              symbol_output_index <= 0;
+            else
+              symbol_output_index <= symbol_output_index + 1;
+            end if;
+          end if;
+
+        when OUTPUT_DATA =>
+          data_out_valid_internal <= '1';
+          uncorrectable_errors_internal <= rs_errors;
+          state <= DONE_STATE;
+
+        when DONE_STATE =>
+          data_out_valid_internal <= '0';
+          state <= IDLE;
+
+      end case;
+    end if;
+  end process;
+
+  -- ===== Output Assignments =====
+  data_out <= rs_decoded_buffer;
+  data_out_valid <= data_out_valid_internal;
+  data_ready <= data_ready_internal;
+  uncorrectable_errors <= uncorrectable_errors_internal;
+
+end architecture rtl;
