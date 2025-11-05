@@ -1,0 +1,183 @@
+-- File: gf_pkg.vhd
+-- Description: Galois Field GF(2^m) arithmetic package with log/antilog tables
+--              Supports m=1 to 10, maximum field size 1024 elements
+
+library ieee;
+use ieee.std_logic_1164.all;
+use ieee.numeric_std.all;
+
+package gf_pkg is
+    
+    constant MAX_M : integer := 10;
+    constant MAX_FIELD_SIZE : integer := 1024;
+    
+    type prim_poly_array_t is array (1 to MAX_M) of integer;
+    constant PRIM_POLYS : prim_poly_array_t := (
+        3, 7, 11, 19, 37, 67, 137, 285, 529, 1033
+    );
+    
+    type gf_table_t is array (0 to MAX_FIELD_SIZE-1) of integer range 0 to MAX_FIELD_SIZE-1;
+    
+    function gf_add(a, b : std_logic_vector) return std_logic_vector;
+    function gf_sub(a, b : std_logic_vector) return std_logic_vector;
+    function gf_mult_comb(a, b : std_logic_vector; prim_poly : integer; m : integer) return std_logic_vector;
+    function gf_inverse(a : std_logic_vector; prim_poly : integer; m : integer) return std_logic_vector;
+    function gf_power(base : std_logic_vector; exp : integer; prim_poly : integer; m : integer) return std_logic_vector;
+    function gen_antilog_table(m : integer; prim_poly : integer) return gf_table_t;
+    function gen_log_table(antilog_table : gf_table_t; field_size : integer) return gf_table_t;
+    
+end package gf_pkg;
+
+package body gf_pkg is
+    
+    function gf_add(a, b : std_logic_vector) return std_logic_vector is
+    begin
+        return a xor b;
+    end function;
+    
+    function gf_sub(a, b : std_logic_vector) return std_logic_vector is
+    begin
+        return a xor b;
+    end function;
+    
+    function gf_mult_comb(a, b : std_logic_vector; prim_poly : integer; m : integer) return std_logic_vector is
+        variable result : unsigned(m-1 downto 0) := (others => '0');
+        variable temp_a : unsigned(m-1 downto 0) := unsigned(a(m-1 downto 0));
+        variable temp_b : unsigned(m-1 downto 0) := unsigned(b(m-1 downto 0));
+        variable msb : std_logic;
+    begin
+        if temp_a = 0 or temp_b = 0 then
+            return std_logic_vector(to_unsigned(0, m));
+        end if;
+        
+        for i in 0 to m-1 loop
+            if temp_b(0) = '1' then
+                result := result xor temp_a;
+            end if;
+            msb := temp_a(m-1);
+            temp_a := shift_left(temp_a, 1);
+            if msb = '1' then
+                temp_a := temp_a xor to_unsigned(prim_poly, m);
+            end if;
+            temp_b := shift_right(temp_b, 1);
+        end loop;
+        
+        return std_logic_vector(result);
+    end function;
+    
+    function gf_inverse(a : std_logic_vector; prim_poly : integer; m : integer) return std_logic_vector is
+        variable u, v, g1, g2, temp : unsigned(m downto 0);
+        variable zero_vec : std_logic_vector(m-1 downto 0);
+    begin
+        zero_vec := (others => '0');
+        
+        if unsigned(a) = 0 then
+            return zero_vec;
+        end if;
+        
+        if unsigned(a) = 1 then
+            return std_logic_vector(to_unsigned(1, m));
+        end if;
+        
+        u := '0' & unsigned(a(m-1 downto 0));
+        v := to_unsigned(prim_poly, m+1);
+        g1 := to_unsigned(1, m+1);
+        g2 := to_unsigned(0, m+1);
+        
+        for outer_iter in 0 to 100 loop
+            if u = 1 or u = 0 then
+                exit;
+            end if;
+            
+            for inner_iter in 0 to 11 loop
+                if u(0) = '1' or u = 0 then
+                    exit;
+                end if;
+                u := shift_right(u, 1);
+                if g1(0) = '0' then
+                    g1 := shift_right(g1, 1);
+                else
+                    g1 := shift_right(g1 xor to_unsigned(prim_poly, m+1), 1);
+                end if;
+            end loop;
+            
+            if u = 1 or u = 0 then
+                exit;
+            end if;
+            
+            if v < u then
+                temp := u; u := v; v := temp;
+                temp := g1; g1 := g2; g2 := temp;
+            end if;
+            
+            u := u xor v;
+            g1 := g1 xor g2;
+        end loop;
+        
+        if u = 1 then
+            return std_logic_vector(g1(m-1 downto 0));
+        else
+            return zero_vec;
+        end if;
+    end function;
+    
+    function gf_power(base : std_logic_vector; exp : integer; prim_poly : integer; m : integer) return std_logic_vector is
+        variable result : std_logic_vector(m-1 downto 0);
+        variable temp_base : std_logic_vector(m-1 downto 0) := base;
+        variable temp_exp : integer := exp;
+    begin
+        result := (others => '0');
+        result(0) := '1';
+        
+        if exp = 0 then
+            return result;
+        end if;
+        
+        for i in 0 to 15 loop
+            if temp_exp = 0 then
+                exit;
+            end if;
+            if (temp_exp mod 2) = 1 then
+                result := gf_mult_comb(result, temp_base, prim_poly, m);
+            end if;
+            temp_base := gf_mult_comb(temp_base, temp_base, prim_poly, m);
+            temp_exp := temp_exp / 2;
+        end loop;
+        
+        return result;
+    end function;
+    
+    function gen_antilog_table(m : integer; prim_poly : integer) return gf_table_t is
+        variable table : gf_table_t;
+        variable alpha : std_logic_vector(m-1 downto 0);
+    begin
+        for i in 0 to MAX_FIELD_SIZE-1 loop
+            table(i) := 0;
+        end loop;
+        
+        table(0) := 1;
+        alpha := (1 => '1', others => '0');
+        
+        for i in 1 to (2**m - 2) loop
+            table(i) := to_integer(unsigned(alpha));
+            alpha := gf_mult_comb(alpha, std_logic_vector(to_unsigned(2, m)), prim_poly, m);
+        end loop;
+        
+        return table;
+    end function;
+    
+    function gen_log_table(antilog_table : gf_table_t; field_size : integer) return gf_table_t is
+        variable table : gf_table_t;
+    begin
+        for i in 0 to MAX_FIELD_SIZE-1 loop
+            table(i) := 0;
+        end loop;
+        
+        table(0) := 0;
+        for i in 0 to field_size - 2 loop
+            table(antilog_table(i)) := i;
+        end loop;
+        return table;
+    end function;
+    
+end package body gf_pkg;
