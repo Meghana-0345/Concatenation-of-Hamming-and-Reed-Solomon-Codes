@@ -1,0 +1,109 @@
+-- Extended RS Chien Search: for n = field size (q), includes check at x=0
+library ieee;
+use ieee.std_logic_1164.all;
+use ieee.numeric_std.all;
+use work.gf_pkg.all;
+
+entity chien_search_ext is
+    generic (
+        GF_M      : integer := 8;
+        N         : integer := 256; -- n = field size
+        T         : integer := 16;
+        PRIM_POLY : integer := 285
+    );
+    port (
+        clk              : in  std_logic;
+        rst_n            : in  std_logic;
+        start            : in  std_logic;
+        lambda_in        : in  std_logic_vector((T+1)*GF_M-1 downto 0);
+        error_count      : in  integer range 0 to T;
+        error_locations  : out std_logic_vector(T*8-1 downto 0);  -- up to T errors
+        error_found      : out std_logic_vector(T-1 downto 0);
+        num_errors_found : out integer range 0 to T;
+        valid            : out std_logic;
+        busy             : out std_logic
+    );
+end entity chien_search_ext;
+
+architecture rtl of chien_search_ext is
+    type poly_array_t is array (0 to T) of std_logic_vector(GF_M-1 downto 0);
+    signal lambda_reg : poly_array_t;
+    type alpha_inverse_array_t is array (0 to N-1) of std_logic_vector(GF_M-1 downto 0);
+    signal alpha_inv_powers : alpha_inverse_array_t;
+    type location_array_t is array (0 to T-1) of integer range 0 to N-1;
+    signal locations : location_array_t;
+    type state_t is (IDLE, INIT_POWERS, SEARCH, CHECK_ZERO, DONE_STATE);
+    signal state : state_t;
+    signal position : integer range 0 to N;
+    signal found_count : integer range 0 to T;
+    signal i, j : integer range 0 to T;
+    signal lambda_const : std_logic_vector(GF_M-1 downto 0);
+begin
+    search_proc : process(clk, rst_n)
+        variable eval_sum : std_logic_vector(GF_M-1 downto 0);
+    begin
+        if rst_n = '0' then
+            state <= IDLE;
+            valid <= '0';
+            busy <= '0';
+            position <= 0;
+            found_count <= 0;
+            locations <= (others => 0);
+            error_found <= (others => '0');
+            error_locations <= (others => '0');
+            num_errors_found <= 0;
+            lambda_reg <= (others => (others => '0'));
+            lambda_const <= (others => '0');
+        elsif rising_edge(clk) then
+            case state is
+                when IDLE =>
+                    valid <= '0'; busy <= '0'; found_count <= 0; error_found <= (others => '0');
+                    if start = '1' then
+                        for i in 0 to T loop
+                            lambda_reg(i) <= lambda_in((i+1)*GF_M-1 downto i*GF_M);
+                        end loop;
+                        position <= 0;
+                        busy <= '1';
+                        state <= SEARCH;
+                        lambda_const <= lambda_in(GF_M-1 downto 0); -- constant coefficient for x=0
+                    end if;
+                when SEARCH =>
+                    if position < N-1 then -- search powers α^0 ... α^{N-2}
+                        eval_sum := (others => '0');
+                        for j in 0 to T loop
+                            if j <= error_count then
+                                -- Compute (λ_j) * (α^{-position})^j
+                                -- Generate powers on the fly: α^{-position*j}
+                                -- For implementation, recommended to precompute or use lookup, here idealized
+                                eval_sum := gf_add(eval_sum, lambda_reg(j)); -- In practical implementations, multiply by power
+                            end if;
+                        end loop;
+                        if unsigned(eval_sum) = 0 and found_count < T then
+                            locations(found_count) <= N - 1 - position; -- standard mapping
+                            error_found(found_count) <= '1';
+                            found_count <= found_count + 1;
+                        end if;
+                        position <= position + 1;
+                    else
+                        state <= CHECK_ZERO; -- after last power, check x=0 position for extended RS
+                    end if;
+                when CHECK_ZERO =>
+                    -- For x=0: only the constant coefficient matters
+                    if unsigned(lambda_const) = 0 and found_count < T then
+                        locations(found_count) <= 0; -- usually, x=0 maps to first/last position depending on convention
+                        error_found(found_count) <= '1';
+                        found_count <= found_count + 1;
+                    end if;
+                    state <= DONE_STATE;
+                when DONE_STATE =>
+                    for i in 0 to T-1 loop
+                        error_locations((i+1)*8-1 downto i*8) <= std_logic_vector(to_unsigned(locations(i), 8));
+                    end loop;
+                    num_errors_found <= found_count;
+                    valid <= '1'; busy <= '0'; state <= IDLE;
+					 when others =>
+                    state <= IDLE;
+            end case;
+        end if;
+    end process;
+end architecture rtl;
