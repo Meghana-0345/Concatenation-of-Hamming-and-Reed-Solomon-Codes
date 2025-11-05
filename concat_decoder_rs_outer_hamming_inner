@@ -1,0 +1,116 @@
+library ieee;
+use ieee.std_logic_1164.all;
+use ieee.numeric_std.all;
+
+entity concat_decoder_rs_outer_hamming_inner is
+  generic (
+    GF_M      : integer := 4;
+    RS_N      : integer := 15;
+    RS_K      : integer := 7;
+    RS_T      : integer := 4;
+    PRIM_POLY : integer := 19;
+    HAM_N     : integer := 15;
+    HAM_K     : integer := 11
+  );
+  port (
+    clk : in std_logic;
+    rst_n : in std_logic;
+    
+    data_in : in std_logic_vector(RS_N * HAM_N - 1 downto 0);
+    data_in_valid : in std_logic;
+    data_ready : out std_logic;
+    
+    data_out : out std_logic_vector(RS_K * GF_M - 1 downto 0);
+    data_out_valid : out std_logic;
+    
+    uncorrectable_errors : out std_logic
+  );
+end entity concat_decoder_rs_outer_hamming_inner;
+
+architecture rtl of concat_decoder_rs_outer_hamming_inner is
+
+  signal hamming_decoded_data : std_logic_vector(RS_N * HAM_K - 1 downto 0);
+  signal hamming_decoded_valid : std_logic;
+  signal hamming_error_flags : std_logic_vector(RS_N - 1 downto 0);
+  signal hamming_ready : std_logic;
+  
+  signal rs_symbols_unpacked : std_logic_vector(RS_N * GF_M - 1 downto 0);
+  signal rs_symbols_valid : std_logic;
+  
+  signal rs_decoded_buffer : std_logic_vector(RS_K * GF_M - 1 downto 0);
+  signal rs_decoded_valid : std_logic;
+  signal rs_errors : std_logic;
+
+begin
+
+  -- ===== STAGE 1: Hamming Decoder =====
+  hamming_decoder_inst : entity work.hamming_decoder_parallel
+    generic map (
+      N => HAM_N,
+      K => HAM_K,
+      NUM_SYMBOLS => RS_N
+    )
+    port map (
+      clk => clk,
+      rst => not rst_n,
+      data_in => data_in,
+      data_in_valid => data_in_valid,
+      data_in_ready => hamming_ready,
+      data_out => hamming_decoded_data,
+      data_out_valid => hamming_decoded_valid,
+      data_out_ready => '1',
+      error_flags => hamming_error_flags
+    );
+
+  -- ===== STAGE 2: Unpack Hamming output =====
+  unpack_hamming_output : process (hamming_decoded_data)
+    variable bit_index : integer;
+  begin
+    bit_index := 0;
+    for i in 0 to RS_N - 1 loop
+      if (bit_index + 3) < (RS_N * HAM_K) then
+        rs_symbols_unpacked((i + 1) * GF_M - 1 downto i * GF_M) <= 
+          hamming_decoded_data(bit_index + 3 downto bit_index);
+        bit_index := bit_index + 4;
+        
+        if (i + 1) mod 3 = 0 then
+          bit_index := bit_index + 1;
+        end if;
+      else
+        rs_symbols_unpacked((i + 1) * GF_M - 1 downto i * GF_M) <= (others => '0');
+      end if;
+    end loop;
+  end process;
+
+  rs_symbols_valid <= hamming_decoded_valid;
+
+  -- ===== STAGE 3: Extract RS information symbols =====
+  extract_rs_info : process (clk, rst_n)
+  begin
+    if rst_n = '0' then
+      rs_decoded_buffer <= (others => '0');
+      rs_decoded_valid <= '0';
+      rs_errors <= '0';
+    elsif rising_edge(clk) then
+      if rs_symbols_valid = '1' then
+        for i in 0 to RS_K - 1 loop
+          rs_decoded_buffer((i + 1) * GF_M - 1 downto i * GF_M) <= 
+            rs_symbols_unpacked((i + 1) * GF_M - 1 downto i * GF_M);
+        end loop;
+        rs_decoded_valid <= '1';
+        
+        rs_errors <= hamming_error_flags(0) or hamming_error_flags(1) or 
+                     hamming_error_flags(2) or hamming_error_flags(3);
+      else
+        rs_decoded_valid <= '0';
+      end if;
+    end if;
+  end process;
+
+  -- ===== Output Assignments =====
+  data_out <= rs_decoded_buffer;
+  data_out_valid <= rs_decoded_valid;
+  uncorrectable_errors <= rs_errors;
+  data_ready <= hamming_ready;
+
+end architecture rtl;
