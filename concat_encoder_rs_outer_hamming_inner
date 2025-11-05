@@ -1,0 +1,188 @@
+library ieee;
+use ieee.std_logic_1164.all;
+use ieee.numeric_std.all;
+
+entity concat_encoder_rs_outer_hamming_inner is
+  generic (
+    GF_M      : integer := 4;
+    RS_N      : integer := 15;
+    RS_K      : integer := 7;
+    RS_T      : integer := 4;
+    PRIM_POLY : integer := 19;
+    HAM_N     : integer := 15;
+    HAM_K     : integer := 11
+  );
+  port (
+    clk : in std_logic;
+    rst_n : in std_logic;
+    
+    data_in : in std_logic_vector(GF_M - 1 downto 0);
+    data_in_valid : in std_logic;
+    data_ready : out std_logic;
+    
+    data_out : out std_logic_vector((RS_N * HAM_N) - 1 downto 0);
+    data_out_valid : out std_logic;
+    data_out_ready : in std_logic
+  );
+end entity concat_encoder_rs_outer_hamming_inner;
+
+architecture rtl of concat_encoder_rs_outer_hamming_inner is
+
+  signal rs_codeword_out : std_logic_vector(GF_M - 1 downto 0);
+  signal rs_codeword_valid : std_logic;
+  signal rs_data_ready : std_logic;
+  signal rs_done : std_logic;
+  signal rs_start : std_logic;
+  
+  type symbol_buffer_t is array (0 to RS_N - 1) of std_logic_vector(GF_M - 1 downto 0);
+  signal rs_symbol_buffer : symbol_buffer_t;
+  signal buffer_write_index : integer range 0 to RS_N - 1;
+  signal buffer_full : std_logic;
+  
+  type state_t is (IDLE, RECEIVE_RS_SYMBOLS, HAMMING_ENCODE, DONE_STATE);
+  signal state : state_t;
+  
+  signal hamming_data_in : std_logic_vector((RS_N * HAM_K) - 1 downto 0);
+  signal hamming_data_out : std_logic_vector((RS_N * HAM_N) - 1 downto 0);
+  signal hamming_valid : std_logic;
+  signal hamming_ready : std_logic;
+
+begin
+
+  -- ===== STAGE 1: Reed-Solomon Encoder =====
+  rs_encoder_inst : entity work.rs_encoder
+    generic map (
+      GF_M => GF_M,
+      N => RS_N,
+      K => RS_K,
+      T => RS_T,
+      PRIM_POLY => PRIM_POLY,
+      SHORTENED => 0
+    )
+    port map (
+      clk => clk,
+      rst_n => rst_n,
+      start => rs_start,
+      data_in => data_in,
+      data_valid => data_in_valid,
+      data_ready => rs_data_ready,
+      parity_out => open,
+      codeword_out => rs_codeword_out,
+      codeword_valid => rs_codeword_valid,
+      done => rs_done
+    );
+
+  -- ===== Buffer RS Output Symbols =====
+  process (clk, rst_n)
+  begin
+    if rst_n = '0' then
+      buffer_write_index <= 0;
+      buffer_full <= '0';
+      rs_symbol_buffer <= (others => (others => '0'));
+    elsif rising_edge(clk) then
+      if state = IDLE then
+        buffer_write_index <= 0;
+        buffer_full <= '0';
+      elsif state = RECEIVE_RS_SYMBOLS and rs_codeword_valid = '1' then
+        rs_symbol_buffer(buffer_write_index) <= rs_codeword_out;
+        if buffer_write_index = RS_N - 1 then
+          buffer_full <= '1';
+          buffer_write_index <= 0;
+        else
+          buffer_write_index <= buffer_write_index + 1;
+        end if;
+      end if;
+    end if;
+  end process;
+
+  -- ===== Pack 4-bit symbols into 11-bit Hamming input format =====
+  pack_to_hamming : process (rs_symbol_buffer)
+    variable bit_index : integer;
+  begin
+    bit_index := 0;
+    for i in 0 to RS_N - 1 loop
+      hamming_data_in(bit_index + 3 downto bit_index) <= rs_symbol_buffer(i);
+      bit_index := bit_index + 4;
+      
+      if (i + 1) mod 3 = 0 then
+        hamming_data_in(bit_index) <= '0';
+        bit_index := bit_index + 1;
+      end if;
+    end loop;
+    
+    for i in bit_index to (RS_N * HAM_K) - 1 loop
+      hamming_data_in(i) <= '0';
+    end loop;
+  end process;
+
+  -- ===== STAGE 2: Hamming Inner Encoder =====
+  hamming_encoder_inst : entity work.hamming_encoder_parallel
+    generic map (
+      N => HAM_N,
+      K => HAM_K,
+      NUM_SYMBOLS => RS_N
+    )
+    port map (
+      clk => clk,
+      rst => not rst_n,
+      data_in => hamming_data_in,
+      data_in_valid => hamming_valid,
+      data_in_ready => hamming_ready,
+      data_out => hamming_data_out,
+      data_out_valid => open,
+      data_out_ready => data_out_ready
+    );
+
+  -- ===== State Machine =====
+  process (clk, rst_n)
+  begin
+    if rst_n = '0' then
+      state <= IDLE;
+      rs_start <= '0';
+      hamming_valid <= '0';
+      data_ready <= '0';
+      data_out_valid <= '0';
+    elsif rising_edge(clk) then
+      case state is
+        when IDLE =>
+          rs_start <= '0';
+          hamming_valid <= '0';
+          data_out_valid <= '0';
+          data_ready <= '1';
+          
+          if data_in_valid = '1' then
+            state <= RECEIVE_RS_SYMBOLS;
+            rs_start <= '1';
+            data_ready <= rs_data_ready;
+          end if;
+
+        when RECEIVE_RS_SYMBOLS =>
+          rs_start <= '0';
+          data_ready <= rs_data_ready;
+          
+          if rs_done = '1' and buffer_full = '1' then
+            state <= HAMMING_ENCODE;
+            hamming_valid <= '1';
+            data_ready <= '0';
+          end if;
+
+        when HAMMING_ENCODE =>
+          hamming_valid <= '1';
+          
+          if hamming_ready = '1' then
+            state <= DONE_STATE;
+            data_out_valid <= '1';
+          end if;
+
+        when DONE_STATE =>
+          if data_out_ready = '1' then
+            data_out_valid <= '0';
+            state <= IDLE;
+          end if;
+      end case;
+    end if;
+  end process;
+
+  data_out <= hamming_data_out;
+
+end architecture rtl;
