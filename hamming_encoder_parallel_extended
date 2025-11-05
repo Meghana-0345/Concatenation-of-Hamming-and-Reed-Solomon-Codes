@@ -1,0 +1,111 @@
+library ieee;
+use ieee.std_logic_1164.all;
+use ieee.numeric_std.all;
+
+entity hamming_encoder_parallel_extended is
+  generic (
+    N : positive := 15;
+    K : positive := 11;
+    NUM_SYMBOLS : positive := 15
+  );
+  port (
+    clk : in std_logic;
+    rst : in std_logic;
+    
+    data_in : in std_logic_vector(NUM_SYMBOLS * K - 1 downto 0);
+    data_in_valid : in std_logic;
+    data_in_ready : buffer std_logic;
+    
+    data_out : out std_logic_vector(NUM_SYMBOLS * N - 1 downto 0);
+    data_out_valid : out std_logic;
+    data_out_ready : in std_logic
+  );
+end entity hamming_encoder_parallel_extended;
+
+architecture rtl of hamming_encoder_parallel_extended is
+
+  constant H_MATRIX_ROW0 : std_logic_vector(14 downto 0) := "111010100000000";
+  constant H_MATRIX_ROW1 : std_logic_vector(14 downto 0) := "110101010000000";
+  constant H_MATRIX_ROW2 : std_logic_vector(14 downto 0) := "101100110000000";
+  constant H_MATRIX_ROW3 : std_logic_vector(14 downto 0) := "011011110000000";
+
+begin
+
+  process (clk)
+    variable input_symbol : std_logic_vector(K - 1 downto 0);
+    variable output_codeword : std_logic_vector(N - 1 downto 0);
+    variable parity : std_logic_vector(3 downto 0);
+    variable j : integer;
+  begin
+    if rising_edge(clk) then
+      if rst = '1' then
+        data_out <= (others => '0');
+        data_out_valid <= '0';
+        data_in_ready <= '0';
+      elsif data_in_valid = '1' and data_in_ready = '1' then
+        
+        for i in 0 to NUM_SYMBOLS - 1 loop
+          input_symbol := data_in((i+1) * K - 1 downto i * K);
+          
+          output_codeword(0) := '0';
+          output_codeword(1) := '0';
+          output_codeword(2) := input_symbol(0);
+          output_codeword(3) := '0';
+          output_codeword(4) := input_symbol(1);
+          output_codeword(5) := input_symbol(2);
+          output_codeword(6) := input_symbol(3);
+          output_codeword(7) := '0';
+          output_codeword(8) := input_symbol(4);
+          output_codeword(9) := input_symbol(5);
+          output_codeword(10) := input_symbol(6);
+          output_codeword(11) := input_symbol(7);
+          output_codeword(12) := input_symbol(8);
+          output_codeword(13) := input_symbol(9);
+          output_codeword(14) := input_symbol(10);
+          
+          parity(0) := '0';
+          for j in 0 to N - 1 loop
+            if H_MATRIX_ROW0(j) = '1' then
+              parity(0) := parity(0) xor output_codeword(j);
+            end if;
+          end loop;
+          
+          parity(1) := '0';
+          for j in 0 to N - 1 loop
+            if H_MATRIX_ROW1(j) = '1' then
+              parity(1) := parity(1) xor output_codeword(j);
+            end if;
+          end loop;
+          
+          parity(2) := '0';
+          for j in 0 to N - 1 loop
+            if H_MATRIX_ROW2(j) = '1' then
+              parity(2) := parity(2) xor output_codeword(j);
+            end if;
+          end loop;
+          
+          parity(3) := '0';
+          for j in 0 to N - 1 loop
+            if H_MATRIX_ROW3(j) = '1' then
+              parity(3) := parity(3) xor output_codeword(j);
+            end if;
+          end loop;
+          
+          output_codeword(0) := parity(0);
+          output_codeword(1) := parity(1);
+          output_codeword(3) := parity(2);
+          output_codeword(7) := parity(3);
+          
+          data_out((i+1) * N - 1 downto i * N) <= output_codeword;
+        end loop;
+        
+        data_out_valid <= '1';
+        data_in_ready <= '0';
+      else
+        data_out_valid <= '0';
+        data_in_ready <= '1';
+      end if;
+    end if;
+  end process;
+
+end architecture rtl;
