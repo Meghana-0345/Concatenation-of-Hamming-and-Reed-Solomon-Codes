@@ -1,0 +1,174 @@
+-- Extended Reed-Solomon Encoder: n = field size
+library ieee;
+use ieee.std_logic_1164.all;
+use ieee.numeric_std.all;
+use work.gf_pkg.all;
+
+entity rs_encoder_ext is
+    generic (
+        GF_M      : integer := 4;          -- change as needed
+        N         : integer := 16;         -- n = field size
+        K         : integer := 11;         -- number of message symbols
+        T         : integer := 2;          -- error correction capability
+        PRIM_POLY : integer := 19;         -- primitive polynomial for GF(16)
+        SHORTENED : integer := 0
+    );
+    port (
+        clk            : in  std_logic;
+        rst_n          : in  std_logic;
+        start          : in  std_logic;
+        data_in        : in  std_logic_vector(GF_M-1 downto 0);
+        data_valid     : in  std_logic;
+        data_ready     : out std_logic;
+        parity_out     : out std_logic_vector(GF_M-1 downto 0); -- outputs parity
+        codeword_out   : out std_logic_vector(GF_M-1 downto 0);
+        codeword_valid : out std_logic;
+        done           : out std_logic
+    );
+end entity rs_encoder_ext;
+
+architecture rtl of rs_encoder_ext is
+    constant NPARITY : integer := N - K; -- extended RS parity count
+    
+    type lfsr_array_t is array (0 to NPARITY) of std_logic_vector(GF_M-1 downto 0); -- one extra for extension
+    signal lfsr : lfsr_array_t;
+  
+    type gen_poly_t is array (0 to NPARITY) of std_logic_vector(GF_M-1 downto 0);
+    signal gen_poly : gen_poly_t;
+    signal gen_poly_init : std_logic := '0';
+    
+    type gen_poly_ext_t is array (0 to NPARITY) of std_logic_vector(GF_M-1 downto 0);
+    signal gen_poly_ext : gen_poly_ext_t;
+
+    type state_t is (IDLE, INIT_GEN_POLY, PROCESS_MSG, OUTPUT_PARITY, DONE_STATE);
+    signal state : state_t;
+    signal symbol_count : integer range 0 to N;
+    signal parity_count : integer range 0 to NPARITY+1;
+    signal init_count : integer range 0 to NPARITY+1;
+
+begin
+    -- Generator polynomial for extended RS: multiply by x, so coefficients are shifted up
+    gen_poly_proc : process(clk, rst_n)
+        variable temp_poly : gen_poly_t;
+        variable new_poly : gen_poly_t;
+        variable alpha_i : std_logic_vector(GF_M-1 downto 0);
+        variable alpha : std_logic_vector(GF_M-1 downto 0);
+        variable j : integer range 0 to NPARITY;
+    begin
+        if rst_n = '0' then
+            gen_poly_init <= '0';
+            gen_poly <= (others => (others => '0'));
+            gen_poly_ext <= (others => (others => '0'));
+        elsif rising_edge(clk) then
+            if state = IDLE and start = '1' and gen_poly_init = '0' then
+                temp_poly(0) := (others => '1'); -- x^0
+                for j in 1 to NPARITY loop
+                    temp_poly(j) := (others => '0');
+                end loop;
+                gen_poly <= temp_poly;
+            elsif state = INIT_GEN_POLY then
+                if init_count > 0 and init_count <= NPARITY then
+                    alpha := (others => '0'); alpha(0) := '1';
+                    alpha_i := gf_power(alpha, init_count, PRIM_POLY, GF_M);
+                    new_poly := (others => (others => '0'));
+                    for j in 0 to NPARITY loop
+                        if j > 0 and j <= init_count then
+                            new_poly(j) := gen_poly(j-1);
+                        end if;
+                        if j <= init_count-1 then
+                            new_poly(j) := gf_add(new_poly(j), gf_mult_comb(gen_poly(j), alpha_i, PRIM_POLY, GF_M));
+                        end if;
+                    end loop;
+                    gen_poly <= new_poly;
+                elsif init_count > NPARITY then
+                    gen_poly_init <= '1';
+                    -- Shift coefficients for x^0 root (multiply by x for extension)
+                    gen_poly_ext(0) <= (others => '0'); -- coefficient of x^0 (force zero for root at zero)
+                    for j in 1 to NPARITY loop
+                        gen_poly_ext(j) <= gen_poly(j-1);
+                    end loop;
+                end if;
+            end if;
+        end if;
+    end process;
+
+    encode_fsm : process(clk, rst_n)
+        variable feedback : std_logic_vector(GF_M-1 downto 0);
+        variable i : integer range 0 to NPARITY;
+    begin
+        if rst_n = '0' then
+            state <= IDLE;
+            lfsr <= (others => (others => '0'));
+            codeword_out <= (others => '0');
+            codeword_valid <= '0';
+            parity_out <= (others => '0');
+            data_ready <= '0';
+            done <= '0';
+            symbol_count <= 0;
+            parity_count <= 0;
+            init_count <= 0;
+        elsif rising_edge(clk) then
+            case state is
+                when IDLE =>
+                    done <= '0';
+                    codeword_valid <= '0';
+                    data_ready <= '0';
+                    symbol_count <= 0;
+                    parity_count <= 0;
+                    init_count <= 0;
+                    if start = '1' then
+                        if gen_poly_init = '0' then
+                            state <= INIT_GEN_POLY;
+                            init_count <= 1;
+                        else
+                            state <= PROCESS_MSG;
+                            data_ready <= '1';
+                        end if;
+                        lfsr <= (others => (others => '0'));
+                    end if;
+                when INIT_GEN_POLY =>
+                    init_count <= init_count + 1;
+                    if init_count > NPARITY then
+                        state <= PROCESS_MSG;
+                        data_ready <= '1';
+                        init_count <= 0;
+                    end if;
+                when PROCESS_MSG =>
+                    if data_valid = '1' then
+                        codeword_out <= data_in;
+                        codeword_valid <= '1';
+                        feedback := gf_add(data_in, lfsr(NPARITY));
+                        for i in NPARITY downto 1 loop
+                            lfsr(i) <= gf_add(lfsr(i-1), gf_mult_comb(feedback, gen_poly_ext(i), PRIM_POLY, GF_M));
+                        end loop;
+                        lfsr(0) <= gf_mult_comb(feedback, gen_poly_ext(0), PRIM_POLY, GF_M);
+                        symbol_count <= symbol_count + 1;
+                        if symbol_count = K - 1 then
+                            state <= OUTPUT_PARITY;
+                            parity_count <= 0;
+                            data_ready <= '0';
+                        end if;
+                    else
+                        codeword_valid <= '0';
+                    end if;
+                when OUTPUT_PARITY =>
+                    parity_out <= lfsr(NPARITY);
+                    codeword_out <= lfsr(NPARITY);
+                    codeword_valid <= '1';
+                    for i in NPARITY downto 1 loop
+                        lfsr(i) <= lfsr(i-1);
+                    end loop;
+                    lfsr(0) <= (others => '0');
+                    parity_count <= parity_count + 1;
+                    if parity_count = NPARITY then
+                        state <= DONE_STATE;
+                    end if;
+                when DONE_STATE =>
+                    codeword_valid <= '0';
+                    done <= '1';
+                    state <= IDLE;
+            end case;
+        end if;
+    end process;
+
+end architecture rtl;
