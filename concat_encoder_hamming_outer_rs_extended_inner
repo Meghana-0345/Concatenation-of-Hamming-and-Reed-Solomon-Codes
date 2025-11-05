@@ -1,0 +1,212 @@
+library ieee;
+use ieee.std_logic_1164.all;
+use ieee.numeric_std.all;
+
+entity concat_encoder_hamming_outer_rs_extended_inner is
+  generic (
+    GF_M      : integer := 4;
+    RS_N      : integer := 16;
+    RS_K      : integer := 7;
+    RS_T      : integer := 4;
+    PRIM_POLY : integer := 19;
+    HAM_N     : integer := 15;
+    HAM_K     : integer := 11
+  );
+  port (
+    clk : in std_logic;
+    rst_n : in std_logic;
+    
+    data_in : in std_logic_vector(HAM_K - 1 downto 0);
+    data_in_valid : in std_logic;
+    data_ready : out std_logic;
+    
+    data_out : out std_logic_vector(GF_M - 1 downto 0);
+    data_out_valid : out std_logic;
+    data_out_ready : in std_logic;
+    
+    done : out std_logic
+  );
+end entity concat_encoder_hamming_outer_rs_extended_inner;
+
+architecture rtl of concat_encoder_hamming_outer_rs_extended_inner is
+
+  signal ham_codeword : std_logic_vector(HAM_N - 1 downto 0);
+  signal ham_codeword_valid : std_logic;
+  signal ham_done : std_logic;
+  signal ham_data_ready : std_logic;
+  
+  type codeword_buffer_t is array (0 to RS_K - 1) of std_logic_vector(HAM_N - 1 downto 0);
+  signal ham_codeword_buffer : codeword_buffer_t;
+  signal buffer_write_index : integer range 0 to RS_K - 1;
+  signal buffer_full : std_logic;
+  
+  type symbol_buffer_t is array (0 to RS_N - 1) of std_logic_vector(GF_M - 1 downto 0);
+  signal rs_input_symbols : symbol_buffer_t;
+  
+  signal rs_symbol_out : std_logic_vector(GF_M - 1 downto 0);
+  signal rs_symbol_valid : std_logic;
+  signal rs_symbol_ready : std_logic;
+  signal rs_start : std_logic;
+  
+  type state_t is (IDLE, COLLECT_HAM, PREPARE_RS, OUTPUT_RS, DONE_STATE);
+  signal state : state_t;
+  signal output_symbol_count : integer range 0 to RS_N - 1;
+
+begin
+
+  -- ===== STAGE 1: Hamming Encoder (Symbol-Level) =====
+  hamming_encoder_inst : entity work.hamming_encoder_symbol_level
+    generic map (
+      N => HAM_N,
+      K => HAM_K
+    )
+    port map (
+      clk => clk,
+      rst_n => rst_n,
+      data_in => data_in,
+      data_in_valid => data_in_valid,
+      data_ready => ham_data_ready,
+      codeword_out => ham_codeword,
+      codeword_valid => ham_codeword_valid,
+      done => ham_done
+    );
+
+  -- ===== Buffer Hamming codewords =====
+  process (clk, rst_n)
+  begin
+    if rst_n = '0' then
+      buffer_write_index <= 0;
+      buffer_full <= '0';
+      ham_codeword_buffer <= (others => (others => '0'));
+    elsif rising_edge(clk) then
+      if state = IDLE then
+        buffer_write_index <= 0;
+        buffer_full <= '0';
+      elsif state = COLLECT_HAM and ham_codeword_valid = '1' then
+        ham_codeword_buffer(buffer_write_index) <= ham_codeword;
+        if buffer_write_index = RS_K - 1 then
+          buffer_full <= '1';
+          buffer_write_index <= 0;
+        else
+          buffer_write_index <= buffer_write_index + 1;
+        end if;
+      end if;
+    end if;
+  end process;
+
+  -- ===== Convert Hamming codewords to RS symbols (Combinatorial) =====
+  convert_to_rs_symbols : process (ham_codeword_buffer)
+    variable bit_index : integer;
+    variable symbol_index : integer;
+    variable temp_symbol : std_logic_vector(GF_M - 1 downto 0);
+  begin
+    -- Initialize all symbols
+    for i in 0 to RS_N - 1 loop
+      rs_input_symbols(i) <= (others => '0');
+    end loop;
+    
+    symbol_index := 0;
+    bit_index := 0;
+    
+    for i in 0 to RS_K - 1 loop
+      for j in 0 to HAM_N - 1 loop
+        if symbol_index < RS_N then
+          temp_symbol := rs_input_symbols(symbol_index);
+          temp_symbol((bit_index mod GF_M)) := ham_codeword_buffer(i)(j);
+          rs_input_symbols(symbol_index) <= temp_symbol;
+          bit_index := bit_index + 1;
+          
+          if (bit_index mod GF_M) = 0 then
+            symbol_index := symbol_index + 1;
+          end if;
+        end if;
+      end loop;
+    end loop;
+  end process;
+
+  -- ===== STAGE 2: Reed-Solomon Extended Encoder =====
+  rs_encoder_ext_inst : entity work.rs_encoder_ext
+    generic map (
+      GF_M => GF_M,
+      N => RS_N,
+      K => RS_K,
+      T => RS_T,
+      PRIM_POLY => PRIM_POLY,
+      SHORTENED => 0
+    )
+    port map (
+      clk => clk,
+      rst_n => rst_n,
+      start => rs_start,
+      data_in => rs_input_symbols(output_symbol_count),
+      data_valid => rs_symbol_valid,
+      data_ready => rs_symbol_ready,
+      parity_out => open,
+      codeword_out => rs_symbol_out,
+      codeword_valid => open,
+      done => open
+    );
+
+  -- ===== State Machine =====
+  process (clk, rst_n)
+  begin
+    if rst_n = '0' then
+      state <= IDLE;
+      data_ready <= '0';
+      data_out_valid <= '0';
+      done <= '0';
+      rs_start <= '0';
+      rs_symbol_valid <= '0';
+      output_symbol_count <= 0;
+    elsif rising_edge(clk) then
+      case state is
+        when IDLE =>
+          rs_start <= '0';
+          rs_symbol_valid <= '0';
+          data_out_valid <= '0';
+          done <= '0';
+          data_ready <= '1';
+          
+          if data_in_valid = '1' then
+            state <= COLLECT_HAM;
+          end if;
+
+        when COLLECT_HAM =>
+          data_ready <= ham_data_ready;
+          
+          if ham_done = '1' and buffer_full = '1' then
+            state <= PREPARE_RS;
+            rs_start <= '1';
+            output_symbol_count <= 0;
+            data_ready <= '0';
+          end if;
+
+        when PREPARE_RS =>
+          rs_start <= '0';
+          state <= OUTPUT_RS;
+          rs_symbol_valid <= '1';
+
+        when OUTPUT_RS =>
+          rs_symbol_valid <= '1';
+          data_out_valid <= '1';
+          
+          if data_out_ready = '1' then
+            if output_symbol_count = RS_N - 1 then
+              state <= DONE_STATE;
+            else
+              output_symbol_count <= output_symbol_count + 1;
+            end if;
+          end if;
+
+        when DONE_STATE =>
+          data_out_valid <= '0';
+          rs_symbol_valid <= '0';
+          done <= '1';
+          state <= IDLE;
+      end case;
+    end if;
+  end process;
+
+  data_out <= rs_symbol_out;
+
+end architecture rtl;
