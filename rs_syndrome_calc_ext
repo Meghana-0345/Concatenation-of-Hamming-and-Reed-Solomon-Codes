@@ -1,0 +1,120 @@
+-- Extended RS syndrome calculator: includes S0 for x=0
+library ieee;
+use ieee.std_logic_1164.all;
+use ieee.numeric_std.all;
+use work.gf_pkg.all;
+
+entity rs_syndrome_calc_ext is
+    generic (
+        GF_M      : integer := 8;
+        N         : integer := 256; -- now n = field size
+        T         : integer := 16;
+        PRIM_POLY : integer := 285
+    );
+    port (
+        clk            : in  std_logic;
+        rst_n          : in  std_logic;
+        start          : in  std_logic;
+        symbol_in      : in  std_logic_vector(GF_M-1 downto 0);
+        symbol_valid   : in  std_logic;
+        syndromes_out  : out std_logic_vector(((2*T)+1)*GF_M-1 downto 0); -- one extra syndrome for x=0
+        syndromes_valid: out std_logic;
+        busy           : out std_logic
+    );
+end entity rs_syndrome_calc_ext;
+
+architecture rtl of rs_syndrome_calc_ext is
+    constant NPARITY : integer := 2 * T;
+
+    -- Add 1 extra syndrome slot for extended RS (S0)
+    type syndrome_array_t is array (0 to NPARITY) of std_logic_vector(GF_M-1 downto 0);
+    signal syndromes : syndrome_array_t;
+
+    type state_t is (IDLE, INIT_POWERS, ACCUMULATE, DONE_STATE);
+    signal state : state_t;
+
+    signal symbol_count : integer range 0 to N;
+    signal init_count : integer range 0 to NPARITY;
+
+    -- powers for S1 to S_{2T} only, index 1 to NPARITY
+    type alpha_powers_t is array (1 to NPARITY) of std_logic_vector(GF_M-1 downto 0);
+    signal alpha_powers : alpha_powers_t;
+    signal power_accum : alpha_powers_t;
+
+begin
+    -- Runtime computation of alpha powers
+    syndrome_proc : process(clk, rst_n)
+        variable temp_product : std_logic_vector(GF_M-1 downto 0);
+        variable alpha : std_logic_vector(GF_M-1 downto 0);
+    begin
+        if rst_n = '0' then
+            state <= IDLE;
+            syndromes <= (others => (others => '0'));
+            syndromes_valid <= '0';
+            busy <= '0';
+            symbol_count <= 0;
+            init_count <= 0;
+            alpha_powers <= (others => (others => '0'));
+            power_accum <= (others => (others => '0'));
+        elsif rising_edge(clk) then
+            case state is
+                when IDLE =>
+                    syndromes_valid <= '0';
+                    busy <= '0';
+                    symbol_count <= 0;
+                    if start = '1' then
+                        state <= INIT_POWERS;
+                        busy <= '1';
+                        init_count <= 1; -- begin from power 1, S1 to S_{2T}
+                        -- Initialize alpha = primitive element (x = 0b10)
+                        alpha := (others => '0'); alpha(0) := '1';
+                        alpha_powers(1) <= alpha; -- alpha^1
+                    end if;
+
+                when INIT_POWERS =>
+                    -- Compute alpha^(i) = alpha^(i-1) * alpha iteratively from i=2 to NPARITY
+                    if init_count < NPARITY then
+                        alpha_powers(init_count + 1) <= gf_mult_comb(
+                            alpha_powers(init_count),
+                            std_logic_vector(to_unsigned(2, GF_M)), -- alpha = 2
+                            PRIM_POLY, GF_M
+                        );
+                        init_count <= init_count + 1;
+                    else
+                        state <= ACCUMULATE;
+                        syndromes <= (others => (others => '0'));
+                        for i in 1 to NPARITY loop
+                            power_accum(i) <= (0 => '1', others => '0'); -- Initialize to 1
+                        end loop;
+                        symbol_count <= 0;
+                    end if;
+
+                when ACCUMULATE =>
+                    if symbol_valid = '1' then
+                        -- Compute S_0 (evaluation at x = 0): S_0 is sum of all constant terms, so just add in every symbol
+                        syndromes(0) <= gf_add(syndromes(0), symbol_in);
+                        -- For S_1 ... S_{2T}: standard syndromes at powers of alpha
+                        for i in 1 to NPARITY loop
+                            temp_product := gf_mult_comb(symbol_in, power_accum(i), PRIM_POLY, GF_M);
+                            syndromes(i) <= gf_add(syndromes(i), temp_product);
+                            power_accum(i) <= gf_mult_comb(power_accum(i), alpha_powers(i), PRIM_POLY, GF_M);
+                        end loop;
+                        symbol_count <= symbol_count + 1;
+                        if symbol_count = N - 1 then
+                            state <= DONE_STATE;
+                        end if;
+                    end if;
+
+                when DONE_STATE =>
+                    -- Output syndromes: S_0 occupies lowest bits, S_1 next, up to S_{2T}
+                    for i in 0 to NPARITY loop
+                        syndromes_out((i+1)*GF_M-1 downto i*GF_M) <= syndromes(i);
+                    end loop;
+                    syndromes_valid <= '1';
+                    busy <= '0';
+                    state <= IDLE;
+            end case;
+        end if;
+    end process;
+
+end architecture rtl;
