@@ -1,0 +1,66 @@
+library ieee;
+use ieee.std_logic_1164.all;
+use ieee.numeric_std.all;
+
+entity rs_decoder_parallel_extended is
+  generic (
+    GF_M      : integer := 4;
+    RS_N      : integer := 16;
+    RS_K      : integer := 7;
+    RS_T      : integer := 4;
+    PRIM_POLY : integer := 19
+  );
+  port (
+    clk : in std_logic;
+    rst_n : in std_logic;
+    
+    data_in : in std_logic_vector(RS_N * GF_M - 1 downto 0);
+    data_in_valid : in std_logic;
+    data_ready : out std_logic;
+    
+    data_out : out std_logic_vector(RS_K * GF_M - 1 downto 0);
+    data_out_valid : out std_logic;
+    
+    error_flags : out std_logic
+  );
+end entity rs_decoder_parallel_extended;
+
+architecture rtl of rs_decoder_parallel_extended is
+
+  signal data_ready_internal : std_logic;
+
+begin
+
+  process (clk, rst_n)
+    variable rs_codeword_in : std_logic_vector(RS_N * GF_M - 1 downto 0);
+  begin
+    if rst_n = '0' then
+      data_out <= (others => '0');
+      data_out_valid <= '0';
+      data_ready_internal <= '0';
+      error_flags <= '0';
+    elsif rising_edge(clk) then
+      if data_in_valid = '1' and data_ready_internal = '1' then
+        
+        -- Extract RS symbols from input
+        rs_codeword_in := data_in;
+        
+        -- Extract first RS_K information symbols
+        for i in 0 to RS_K - 1 loop
+          data_out((i + 1) * GF_M - 1 downto i * GF_M) <= rs_codeword_in((i + 1) * GF_M - 1 downto i * GF_M);
+        end loop;
+        
+        data_out_valid <= '1';
+        data_ready_internal <= '0';
+        error_flags <= '0';
+      else
+        data_out_valid <= '0';
+        data_ready_internal <= '1';
+      end if;
+    end if;
+  end process;
+
+  -- Output assignment
+  data_ready <= data_ready_internal;
+
+end architecture rtl;
