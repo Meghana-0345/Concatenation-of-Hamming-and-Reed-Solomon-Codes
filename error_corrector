@@ -1,0 +1,82 @@
+-- File: error_corrector.vhd
+-- Description: Applies error corrections
+
+library ieee;
+use ieee.std_logic_1164.all;
+use ieee.numeric_std.all;
+
+entity error_corrector is
+    generic (
+        GF_M : integer := 8;
+        N    : integer := 255;
+        T    : integer := 16
+    );
+    port (
+        clk             : in  std_logic;
+        rst_n           : in  std_logic;
+        start           : in  std_logic;
+        received_data   : in  std_logic_vector(N*GF_M-1 downto 0);
+        error_locations : in  std_logic_vector(T*8-1 downto 0);
+        error_values    : in  std_logic_vector(T*GF_M-1 downto 0);
+        num_errors      : in  integer range 0 to T;
+        corrected_data  : out std_logic_vector(N*GF_M-1 downto 0);
+        valid           : out std_logic
+    );
+end entity error_corrector;
+
+architecture rtl of error_corrector is
+    
+    type symbol_array_t is array (0 to N-1) of std_logic_vector(GF_M-1 downto 0);
+    signal data_buffer : symbol_array_t;
+    
+    type state_t is (IDLE, CORRECT, DONE_STATE);
+    signal state : state_t;
+    
+    signal error_index : integer range 0 to T;
+    
+begin
+    
+    correction_proc : process(clk, rst_n)
+        variable location : integer range 0 to N-1;
+        variable error_val : std_logic_vector(GF_M-1 downto 0);
+        variable i : integer range 0 to N-1;
+    begin
+        if rst_n = '0' then
+            state <= IDLE;
+            valid <= '0';
+            error_index <= 0;
+            data_buffer <= (others => (others => '0'));
+            corrected_data <= (others => '0');
+        elsif rising_edge(clk) then
+            case state is
+                when IDLE =>
+                    valid <= '0';
+                    if start = '1' then
+                        for i in 0 to N-1 loop
+                            data_buffer(i) <= received_data((i+1)*GF_M-1 downto i*GF_M);
+                        end loop;
+                        error_index <= 0;
+                        state <= CORRECT;
+                    end if;
+                when CORRECT =>
+                    if error_index < num_errors then
+                        location := to_integer(unsigned(error_locations((error_index+1)*8-1 downto error_index*8)));
+                        error_val := error_values((error_index+1)*GF_M-1 downto error_index*GF_M);
+                        if location < N then
+                            data_buffer(location) <= data_buffer(location) xor error_val;
+                        end if;
+                        error_index <= error_index + 1;
+                    else
+                        state <= DONE_STATE;
+                    end if;
+                when DONE_STATE =>
+                    for i in 0 to N-1 loop
+                        corrected_data((i+1)*GF_M-1 downto i*GF_M) <= data_buffer(i);
+                    end loop;
+                    valid <= '1';
+                    state <= IDLE;
+            end case;
+        end if;
+    end process;
+    
+end architecture rtl;
