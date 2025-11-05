@@ -1,0 +1,169 @@
+-- File: forney_algorithm.vhd
+-- Description: Forney algorithm with simplified computation
+
+library ieee;
+use ieee.std_logic_1164.all;
+use ieee.numeric_std.all;
+use work.gf_pkg.all;
+
+entity forney_algorithm is
+    generic (
+        GF_M      : integer := 8;
+        T         : integer := 16;
+        PRIM_POLY : integer := 285
+    );
+    port (
+        clk             : in  std_logic;
+        rst_n           : in  std_logic;
+        start           : in  std_logic;
+        lambda_in       : in  std_logic_vector((T+1)*GF_M-1 downto 0);
+        omega_in        : in  std_logic_vector((T+1)*GF_M-1 downto 0);
+        error_locations : in  std_logic_vector(T*8-1 downto 0);
+        num_errors      : in  integer range 0 to T;
+        error_values    : out std_logic_vector(T*GF_M-1 downto 0);
+        valid           : out std_logic;
+        busy            : out std_logic
+    );
+end entity forney_algorithm;
+
+architecture rtl of forney_algorithm is
+    
+    type poly_array_t is array (0 to T) of std_logic_vector(GF_M-1 downto 0);
+    signal lambda, omega : poly_array_t;
+    
+    type location_array_t is array (0 to T-1) of integer range 0 to 255;
+    signal locations : location_array_t;
+    
+    type value_array_t is array (0 to T-1) of std_logic_vector(GF_M-1 downto 0);
+    signal values : value_array_t;
+    
+    type state_t is (IDLE, COMPUTE_POWER, EVAL_OMEGA, EVAL_LAMBDA, DIVIDE, NEXT_ERROR, DONE_STATE);
+    signal state : state_t;
+    
+    signal error_index : integer range 0 to T;
+    signal eval_index : integer range 0 to T;
+    signal X_inv, X_inv_power : std_logic_vector(GF_M-1 downto 0);
+    signal omega_eval, lambda_deriv_eval : std_logic_vector(GF_M-1 downto 0);
+    signal power_count : integer range 0 to 255;
+    
+begin
+    
+    forney_proc : process(clk, rst_n)
+        variable X : std_logic_vector(GF_M-1 downto 0);
+        variable alpha : std_logic_vector(GF_M-1 downto 0);
+        variable i, j : integer range 0 to T;
+        variable temp_val : std_logic_vector(GF_M-1 downto 0);
+    begin
+        if rst_n = '0' then
+            state <= IDLE;
+            valid <= '0';
+            busy <= '0';
+            error_index <= 0;
+            eval_index <= 0;
+            lambda <= (others => (others => '0'));
+            omega <= (others => (others => '0'));
+            locations <= (others => 0);
+            values <= (others => (others => '0'));
+            error_values <= (others => '0');
+            X_inv <= (others => '0');
+            X_inv_power <= (others => '0');
+            omega_eval <= (others => '0');
+            lambda_deriv_eval <= (others => '0');
+            power_count <= 0;
+        elsif rising_edge(clk) then
+            case state is
+                when IDLE =>
+                    valid <= '0';
+                    busy <= '0';
+                    if start = '1' then
+                        for i in 0 to T loop
+                            lambda(i) <= lambda_in((i+1)*GF_M-1 downto i*GF_M);
+                            omega(i) <= omega_in((i+1)*GF_M-1 downto i*GF_M);
+                        end loop;
+                        for i in 0 to T-1 loop
+                            locations(i) <= to_integer(unsigned(error_locations((i+1)*8-1 downto i*8)));
+                        end loop;
+                        error_index <= 0;
+                        power_count <= 0;
+                        state <= COMPUTE_POWER;
+                        busy <= '1';
+                    end if;
+                    
+                when COMPUTE_POWER =>
+                    if error_index < num_errors then
+                        -- Compute X = alpha^location iteratively
+                        alpha := (1 => '1', others => '0');
+                        
+                        -- Incrementally compute alpha^power_count
+                        if power_count < locations(error_index) then
+                            X_inv <= gf_mult_comb(X_inv, alpha, PRIM_POLY, GF_M);
+                            power_count <= power_count + 1;
+                        else
+                            -- Finished computing alpha^location
+                            X_inv_power <= X_inv;
+                            omega_eval <= omega(0);
+                            eval_index <= 0;
+                            power_count <= 0;
+                            state <= EVAL_OMEGA;
+                        end if;
+                    else
+                        state <= DONE_STATE;
+                    end if;
+                    
+                when EVAL_OMEGA =>
+                    if eval_index < T then
+                        omega_eval <= gf_add(omega_eval, gf_mult_comb(omega(eval_index + 1), X_inv_power, PRIM_POLY, GF_M));
+                        X_inv_power <= gf_mult_comb(X_inv_power, X_inv, PRIM_POLY, GF_M);
+                        eval_index <= eval_index + 1;
+                    else
+                        eval_index <= 1;
+                        X_inv_power <= X_inv;
+                        lambda_deriv_eval <= lambda(1);
+                        state <= EVAL_LAMBDA;
+                    end if;
+                    
+                when EVAL_LAMBDA =>
+                    -- Evaluate derivative (odd terms only)
+                    if eval_index <= T then
+                        if (eval_index mod 2) = 1 then
+                            lambda_deriv_eval <= gf_add(lambda_deriv_eval,
+                                gf_mult_comb(lambda(eval_index), X_inv_power, PRIM_POLY, GF_M));
+                        end if;
+                        X_inv_power <= gf_mult_comb(X_inv_power, X_inv, PRIM_POLY, GF_M);
+                        eval_index <= eval_index + 1;
+                    else
+                        state <= DIVIDE;
+                    end if;
+                    
+                when DIVIDE =>
+                    if unsigned(lambda_deriv_eval) /= 0 then
+                        temp_val := gf_inverse(lambda_deriv_eval, PRIM_POLY, GF_M);
+                        values(error_index) <= gf_mult_comb(omega_eval, temp_val, PRIM_POLY, GF_M);
+                    else
+                        values(error_index) <= (others => '0');
+                    end if;
+                    state <= NEXT_ERROR;
+                    
+                when NEXT_ERROR =>
+                    error_index <= error_index + 1;
+                    power_count <= 0;
+                    X_inv <= (0 => '1', others => '0'); -- Reset to 1 for next iteration
+                    if error_index + 1 >= num_errors then
+                        state <= DONE_STATE;
+                    else
+                        state <= COMPUTE_POWER;
+                    end if;
+                    
+                when DONE_STATE =>
+                    for i in 0 to T-1 loop
+                        error_values((i+1)*GF_M-1 downto i*GF_M) <= values(i);
+                    end loop;
+                    valid <= '1';
+                    busy <= '0';
+                    state <= IDLE;
+                    
+            end case;
+        end if;
+    end process;
+    
+end architecture rtl;
