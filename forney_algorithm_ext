@@ -1,0 +1,127 @@
+library ieee;
+use ieee.std_logic_1164.all;
+use ieee.numeric_std.all;
+use work.gf_pkg.all;
+
+entity forney_algorithm_ext is
+    generic (
+        GF_M      : integer := 8;
+        T         : integer := 16;
+        PRIM_POLY : integer := 285
+    );
+    port (
+        clk             : in  std_logic;
+        rst_n           : in  std_logic;
+        start           : in  std_logic;
+        lambda_in       : in  std_logic_vector((T+1)*GF_M-1 downto 0);
+        omega_in        : in  std_logic_vector((T+1)*GF_M-1 downto 0);
+        error_locations : in  std_logic_vector(T*8-1 downto 0);
+        num_errors      : in  integer range 0 to T;
+        error_values    : out std_logic_vector(T*GF_M-1 downto 0);
+        valid           : out std_logic;
+        busy            : out std_logic
+    );
+end entity forney_algorithm_ext;
+
+architecture rtl of forney_algorithm_ext is
+    type poly_array_t is array (0 to T) of std_logic_vector(GF_M-1 downto 0);
+    signal lambda, omega : poly_array_t;
+    type location_array_t is array (0 to T-1) of integer range 0 to 255;
+    signal locations : location_array_t;
+    type value_array_t is array (0 to T-1) of std_logic_vector(GF_M-1 downto 0);
+    signal values : value_array_t;
+    type state_t is (IDLE, EVAL, DONE_STATE);
+    signal state : state_t := IDLE;
+    signal error_index : integer range 0 to T := 0;
+begin
+    forney_proc : process(clk, rst_n)
+        -- remove a single 'j' variable used for for-loops; we'll use explicit names in loops
+        variable loc_pos    : integer;
+        variable X          : std_logic_vector(GF_M-1 downto 0);
+        variable X_pow      : std_logic_vector(GF_M-1 downto 0);
+        variable temp_omega : std_logic_vector(GF_M-1 downto 0);
+        variable temp_lambda_deriv : std_logic_vector(GF_M-1 downto 0);
+        variable temp_val   : std_logic_vector(GF_M-1 downto 0);
+        variable cnt        : integer; -- used for while loops
+    begin
+        if rst_n = '0' then
+            state <= IDLE;
+            valid <= '0'; busy <= '0';
+            error_index <= 0;
+            lambda <= (others => (others => '0'));
+            omega <= (others => (others => '0'));
+            locations <= (others => 0);
+            values <= (others => (others => '0'));
+            error_values <= (others => '0');
+        elsif rising_edge(clk) then
+            case state is
+                when IDLE =>
+                    valid <= '0'; busy <= '0';
+                    if start = '1' then
+                        -- load lambda & omega from wide vectors (T is a generic -> static)
+                        for ii in 0 to T loop
+                            lambda(ii) <= lambda_in((ii+1)*GF_M-1 downto ii*GF_M);
+                            omega(ii)  <= omega_in((ii+1)*GF_M-1 downto ii*GF_M);
+                        end loop;
+                        for ii in 0 to T-1 loop
+                            locations(ii) <= to_integer(unsigned(error_locations((ii+1)*8-1 downto ii*8)));
+                        end loop;
+                        error_index <= 0;
+                        busy <= '1';
+                        state <= EVAL;
+                    end if;
+                when EVAL =>
+                    if error_index < num_errors then
+                        loc_pos := locations(error_index);
+
+                        -- compute X = alpha^loc_pos (alpha = 2 assumed)
+                        X := (others => '0');
+                        X(0) := '1';
+                        -- use a while loop because loc_pos is a variable (not a static bound)
+                        cnt := 1;
+                        while cnt <= loc_pos loop
+                            X := gf_mult_comb(X, std_logic_vector(to_unsigned(2, GF_M)), PRIM_POLY, GF_M);
+                            cnt := cnt + 1;
+                        end loop;
+
+                        -- Evaluate omega(X) (you had omega(X_inv) in comment; code evaluates omega at X)
+                        temp_omega := (others => '0');
+                        X_pow := (others => '0'); X_pow(0) := '1';
+                        for jj in 0 to T loop
+                            temp_omega := gf_add(temp_omega, gf_mult_comb(omega(jj), X_pow, PRIM_POLY, GF_M));
+                            X_pow := gf_mult_comb(X_pow, X, PRIM_POLY, GF_M);
+                        end loop;
+
+                        -- lambda'(X): only odd powers contribute (derivative in GF(2^m))
+                        temp_lambda_deriv := (others => '0');
+                        X_pow := X; -- corresponds to X^1 initially
+                        for jj in 1 to T loop
+                            if (jj mod 2) = 1 then
+                                temp_lambda_deriv := gf_add(temp_lambda_deriv, gf_mult_comb(lambda(jj), X_pow, PRIM_POLY, GF_M));
+                            end if;
+                            X_pow := gf_mult_comb(X_pow, X, PRIM_POLY, GF_M);
+                        end loop;
+
+                        if unsigned(temp_lambda_deriv) /= 0 then
+                            temp_val := gf_mult_comb(temp_omega, gf_inverse(temp_lambda_deriv, PRIM_POLY, GF_M), PRIM_POLY, GF_M);
+                        else
+                            temp_val := (others => '0');
+                        end if;
+
+                        values(error_index) <= temp_val;
+                        error_index <= error_index + 1;
+                    else
+                        state <= DONE_STATE;
+                    end if;
+                when DONE_STATE =>
+                    -- assign back to wide vector (static T used)
+                    for kk in 0 to T-1 loop
+                        error_values((kk+1)*GF_M-1 downto kk*GF_M) <= values(kk);
+                    end loop;
+                    valid <= '1'; busy <= '0'; state <= IDLE;
+                when others =>
+                    state <= IDLE;
+            end case;
+        end if;
+    end process;
+end architecture rtl;
