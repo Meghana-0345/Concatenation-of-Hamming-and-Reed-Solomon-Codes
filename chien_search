@@ -1,0 +1,136 @@
+-- File: chien_search.vhd
+-- Description: Chien search with runtime alpha power computation
+
+library ieee;
+use ieee.std_logic_1164.all;
+use ieee.numeric_std.all;
+use work.gf_pkg.all;
+
+entity chien_search is
+    generic (
+        GF_M      : integer := 8;
+        N         : integer := 255;
+        T         : integer := 16;
+        PRIM_POLY : integer := 285
+    );
+    port (
+        clk              : in  std_logic;
+        rst_n            : in  std_logic;
+        start            : in  std_logic;
+        lambda_in        : in  std_logic_vector((T+1)*GF_M-1 downto 0);
+        error_count      : in  integer range 0 to T;
+        error_locations  : out std_logic_vector(T*8-1 downto 0);
+        error_found      : out std_logic_vector(T-1 downto 0);
+        num_errors_found : out integer range 0 to T;
+        valid            : out std_logic;
+        busy             : out std_logic
+    );
+end entity chien_search;
+
+architecture rtl of chien_search is
+    
+    type poly_array_t is array (0 to T) of std_logic_vector(GF_M-1 downto 0);
+    signal lambda, lambda_reg : poly_array_t;
+    
+    type alpha_power_array_t is array (1 to T) of std_logic_vector(GF_M-1 downto 0);
+    signal alpha_powers : alpha_power_array_t;
+    
+    type location_array_t is array (0 to T-1) of integer range 0 to 255;
+    signal locations : location_array_t;
+    
+    type state_t is (IDLE, INIT_POWERS, SEARCH, DONE_STATE);
+    signal state : state_t;
+    
+    signal position : integer range 0 to N;
+    signal found_count : integer range 0 to T;
+    signal init_count : integer range 0 to T;
+    
+begin
+    
+    search_proc : process(clk, rst_n)
+        variable eval_sum : std_logic_vector(GF_M-1 downto 0);
+        variable i, j : integer range 0 to T;
+        variable alpha : std_logic_vector(GF_M-1 downto 0);
+    begin
+        if rst_n = '0' then
+            state <= IDLE;
+            valid <= '0';
+            busy <= '0';
+            position <= 0;
+            found_count <= 0;
+            init_count <= 0;
+            lambda <= (others => (others => '0'));
+            lambda_reg <= (others => (others => '0'));
+            locations <= (others => 0);
+            error_found <= (others => '0');
+            error_locations <= (others => '0');
+            num_errors_found <= 0;
+            alpha_powers <= (others => (others => '0'));
+        elsif rising_edge(clk) then
+            case state is
+                when IDLE =>
+                    valid <= '0';
+                    busy <= '0';
+                    found_count <= 0;
+                    error_found <= (others => '0');
+                    if start = '1' then
+                        for i in 0 to T loop
+                            lambda(i) <= lambda_in((i+1)*GF_M-1 downto i*GF_M);
+                            lambda_reg(i) <= lambda_in((i+1)*GF_M-1 downto i*GF_M);
+                        end loop;
+                        state <= INIT_POWERS;
+                        init_count <= 1;
+                        alpha := (1 => '1', others => '0');
+                        alpha_powers(1) <= alpha;
+                        busy <= '1';
+                    end if;
+                    
+                when INIT_POWERS =>
+                    -- Compute alpha^j = alpha^(j-1) * alpha iteratively
+                    if init_count < T then
+                        alpha_powers(init_count + 1) <= gf_mult_comb(
+                            alpha_powers(init_count),
+                            std_logic_vector(to_unsigned(2, GF_M)),
+                            PRIM_POLY, GF_M
+                        );
+                        init_count <= init_count + 1;
+                    else
+                        state <= SEARCH;
+                        position <= 0;
+                    end if;
+                    
+                when SEARCH =>
+                    eval_sum := (others => '0');
+                    for j in 0 to T loop
+                        if j <= error_count then
+                            eval_sum := gf_add(eval_sum, lambda_reg(j));
+                        end if;
+                    end loop;
+                    if unsigned(eval_sum) = 0 and found_count < T then
+                        locations(found_count) <= N - 1 - position;
+                        error_found(found_count) <= '1';
+                        found_count <= found_count + 1;
+                    end if;
+                    for j in 1 to T loop
+                        if j <= error_count then
+                            lambda_reg(j) <= gf_mult_comb(lambda_reg(j), alpha_powers(j), PRIM_POLY, GF_M);
+                        end if;
+                    end loop;
+                    position <= position + 1;
+                    if position = N - 1 then
+                        state <= DONE_STATE;
+                    end if;
+                    
+                when DONE_STATE =>
+                    for i in 0 to T-1 loop
+                        error_locations((i+1)*8-1 downto i*8) <= std_logic_vector(to_unsigned(locations(i), 8));
+                    end loop;
+                    num_errors_found <= found_count;
+                    valid <= '1';
+                    busy <= '0';
+                    state <= IDLE;
+            end case;
+        end if;
+    end process;
+    
+end architecture rtl;
