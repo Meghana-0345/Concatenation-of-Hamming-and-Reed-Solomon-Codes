@@ -1,0 +1,24 @@
+library ieee;
+use ieee.std_logic_1164.all;
+
+entity symbol_bits_converter is
+  generic (
+    RS_M : positive := 4;              -- Bits per GF symbol
+    RS_N : positive := 15;             -- Number of symbols
+    HAM_K : positive := 11;            -- Hamming info bits per codeword
+    MODE : string := "SYM_TO_BITS"     -- "SYM_TO_BITS" or "BITS_TO_SYM"
+  );
+  port (
+    data_in : in std_logic_vector(RS_N * RS_M - 1 downto 0);
+    data_out : out std_logic_vector(RS_N * RS_M - 1 downto 0)
+  );
+end entity symbol_bits_converter;
+
+architecture rtl of symbol_bits_converter is
+begin
+
+  -- Direct pass-through for 1:1 mapping when RS_M bits map to RS_M bits
+  -- If customized mapping needed, implement here
+  data_out <= data_in;
+
+end architecture rtl;
